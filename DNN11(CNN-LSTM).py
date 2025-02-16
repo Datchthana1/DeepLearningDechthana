@@ -16,17 +16,25 @@ from skopt import gp_minimize
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
+
 # Metric functions
 def MAE(true, pred):
     return np.mean(np.abs(true - pred))
+
+
 def MSE(true, pred):
     return np.mean((true - pred) ** 2)
+
+
 def RMSE(true, pred):
     return np.sqrt(MSE(true, pred))
+
+
 def R2(true, pred):
     ss_res = np.sum((true - pred) ** 2)
     ss_tot = np.sum((true - np.mean(true)) ** 2)
     return 1 - ss_res / ss_tot
+
 
 # Plotting setup
 sns.set(style='whitegrid', palette='muted', font_scale=1.2)
@@ -37,70 +45,77 @@ np.random.seed(RANDOM_SEED)
 torch.manual_seed(RANDOM_SEED)
 
 # Data loading
-data_path = rf'Y:\รันDeepในเครื่องอาจารย์บุ๊ค\partition_combined_data_upsampled_pm_3H_spline_1degreeM.csv'
+data_path = rf'C:\Users\CO19\Downloads\รันDeepในเครื่องอาจารย์บุ๊ค\partition_combined_data_upsampled_pm_3H_spline_1degreeM.csv'
 confirmed = pd.read_csv(data_path)
 confirmed = confirmed[['TP', 'WS', 'AP', 'HM', 'WD', 'PCPT', 'PM2.5', 'Season']]
 print(f'Original Size: \n{confirmed}\n')
-confirmed['PM2.5B'] = confirmed['PM2.5'].shift(1)
-confirmed = confirmed[['TP', 'WS', 'AP', 'HM', 'WD', 'PCPT', 'PM2.5', 'Season', 'PM2.5B']]
-print(f'Describe Dataframe: \n{confirmed.describe().to_string()}')
-confirmed = confirmed[['TP', 'WS', 'AP', 'HM', 'WD', 'PCPT', 'PM2.5', 'Season', 'PM2.5B']].values.astype('float32')
+# confirmed['PM2.5B'] = confirmed['PM2.5'].shift(1)
+# confirmed = confirmed[['TP', 'WS', 'AP', 'HM', 'WD', 'PCPT', 'Season', 'PM2.5B']]
+# print(f'Describe Dataframe: \n{confirmed.describe().to_string()}')
+# confirmed = confirmed[['TP', 'WS', 'AP', 'HM', 'WD', 'PCPT', 'Season', 'PM2.5B']][:200]
 print(f'Dataframe: {confirmed}')
 
-def create_sequences(data, seq_length):
+
+def create_sequences(X, y, seq_length):
     xs, ys = [], []
-    for i in range(len(data) - seq_length):
-        xs.append(data[i:(i + seq_length)])
-        ys.append(data[i + seq_length, 0])
+    for i in range(len(X) - seq_length):
+        xs.append(X[i:(i + seq_length)])
+        ys.append(y[i + seq_length])
+        # print(f'\nxs: {xs}\n ys: {ys}')
     return np.array(xs), np.array(ys)
 
-def prepare_data(data, seq_length, train_size=0.7, val_size=0.15):
-    X, y = create_sequences(data, seq_length)
-    
+
+def prepare_data(confirmed, seq_length, train_size=0.7, val_size=0.15):
+    X, y = confirmed[['TP', 'WS', 'AP', 'HM', 'WD', 'PCPT', 'Season']].values.astype('float32') , confirmed['PM2.5'].values.astype('float32')
+    X, y = create_sequences(X, y, seq_length)
+
     train_idx = int(len(X) * train_size)
     val_idx = int(len(X) * (train_size + val_size))
-    
+
     X_train, y_train = X[:train_idx], y[:train_idx]
     X_val, y_val = X[train_idx:val_idx], y[train_idx:val_idx]
     X_test, y_test = X[val_idx:], y[val_idx:]
-    
+
     min_val = X_train[:, :, 0].min()
     max_val = X_train[:, :, 0].max()
-    
+
     def MinMaxScale(array, min_val, max_val):
         return (array - min_val) / (max_val - min_val)
-    
+
     X_train = MinMaxScale(X_train, min_val, max_val)
     y_train = MinMaxScale(y_train, min_val, max_val)
     X_val = MinMaxScale(X_val, min_val, max_val)
     y_val = MinMaxScale(y_val, min_val, max_val)
     X_test = MinMaxScale(X_test, min_val, max_val)
     y_test = MinMaxScale(y_test, min_val, max_val)
-    
+
     X_train = torch.from_numpy(X_train).float().to(device)
     y_train = torch.from_numpy(y_train).float().to(device)
     X_val = torch.from_numpy(X_val).float().to(device)
     y_val = torch.from_numpy(y_val).float().to(device)
     X_test = torch.from_numpy(X_test).float().to(device)
     y_test = torch.from_numpy(y_test).float().to(device)
-    
+
     return (X_train, y_train, X_val, y_val, X_test, y_test), (min_val, max_val)
 
+
 class Model(nn.Module):
-    def __init__(self, n_features, cnn_hidden, cnn_dropout,
+    def __init__(self, n_features, cnn_hidden1, cnn_hidden2, cnn_dropout,
                  lstm_hidden, lstm_layers, lstm_dropout, seq_len):
         super(Model, self).__init__()
         self.seq_len = seq_len
         fixed_kernel = 2
         self.cnn = nn.Sequential(
-            nn.Conv1d(in_channels=n_features, out_channels=cnn_hidden,
+            nn.Conv1d(in_channels=n_features, out_channels=cnn_hidden1,
                       kernel_size=fixed_kernel, stride=1, padding=1),
             nn.ReLU(),
-            nn.AvgPool1d(kernel_size=fixed_kernel, stride=1, padding=1),
+            nn.MaxPool1d(kernel_size=fixed_kernel, stride=1, padding=1),
             nn.ReLU(),
+            nn.Conv1d(in_channels=cnn_hidden1, out_channels=cnn_hidden2, kernel_size=1, stride=1),
+            nn.MaxPool1d(kernel_size=fixed_kernel, stride=1, padding=1),
             nn.Dropout(cnn_dropout)
         )
-        self.lstm = nn.LSTM(input_size=cnn_hidden, hidden_size=lstm_hidden,
+        self.lstm = nn.LSTM(input_size=cnn_hidden2, hidden_size=lstm_hidden,
                             num_layers=lstm_layers,
                             dropout=lstm_dropout if lstm_layers > 1 else 0.0,
                             batch_first=True)
@@ -115,10 +130,12 @@ class Model(nn.Module):
         y_pred = self.linear(last_time_step)
         return y_pred
 
+
 # Define the optimization space
 space = [
     Integer(3, 20, name='seq_length'),
-    Integer(16, 64, name='cnn_hidden'),
+    Integer(16, 256, name='cnn_hidden1'),
+    Integer(16, 256, name='cnn_hidden2'),
     Real(0.0, 0.5, name='cnn_dropout'),
     Integer(16, 64, name='lstm_hidden'),
     Integer(1, 5, name='lstm_layers'),
@@ -127,15 +144,17 @@ space = [
     Integer(1000, 1500, name='epochs')
 ]
 
+
 # Objective function for Bayesian optimization
 @use_named_args(space)
 def objective(**params):
     seq_length = params['seq_length']
     (X_train, y_train, X_val, y_val, _, _), (min_val, max_val) = prepare_data(confirmed, seq_length)
-    
+
     print(f'''
           seq_length : {seq_length},
-          cnn_hidden : {params['cnn_hidden']},
+          cnn_hidden1 : {params['cnn_hidden1']},
+          cnn_hidden2 : {params['cnn_hidden2']},
           cnn_dropout : {params['cnn_dropout']},
           lstm_hidden : {params['lstm_hidden']},
           lstm_layers : {params['lstm_layers']},
@@ -143,22 +162,23 @@ def objective(**params):
           lr : {params['lr']},
           epochs : {params['epochs']}
           ''')
-    
-    print(f'---'*5 + ' Start Model ' + '---'*5)
-    
+
+    print(f'---' * 5 + ' Start Model ' + '---' * 5)
+
     model = Model(
-        n_features=8,
-        cnn_hidden=params['cnn_hidden'],
-        cnn_dropout=params['cnn_dropout'],
-        lstm_hidden=params['lstm_hidden'],
-        lstm_layers=params['lstm_layers'],
-        lstm_dropout=params['lstm_dropout'],
-        seq_len=seq_length
+        n_features=7,
+        cnn_hidden1=int(params['cnn_hidden1']),
+        cnn_hidden2=int(params['cnn_hidden2']),
+        cnn_dropout=float(params['cnn_dropout']),
+        lstm_hidden=int(params['lstm_hidden']),
+        lstm_layers=int(params['lstm_layers']),
+        lstm_dropout=float(params['lstm_dropout']),
+        seq_len=int(seq_length)
     ).to(device)
-    
+
     optimizer = optim.Adam(model.parameters(), lr=params['lr'])
     loss_fn = nn.MSELoss()
-    
+
     # Training
     model.train()
     for epoch in range(params['epochs']):
@@ -172,9 +192,9 @@ def objective(**params):
 
         if (epoch + 1) % 100 == 0 or epoch == params['epochs'] - 1:
             print(f'Epoch [{epoch + 1}/{params["epochs"]}]')
-    
-    print(f'---'*5 + 'Start Model Evaluate' + '---'*5)
-    
+
+    print(f'---' * 5 + 'Start Model Evaluate' + '---' * 5)
+
     # Validation
     model.eval()
     val_loss = 0
@@ -188,28 +208,28 @@ def objective(**params):
             val_loss += loss.item()
             predictions.append(y_val_pred.squeeze().cpu().numpy())
             true_vals.append(y_val[idx].cpu().numpy())
-    
+
     avg_val_loss = val_loss / len(X_val)
     print(f'Average validation loss: {avg_val_loss}')
-    
+
     # Save trial results
     trial_data = {
         "value": avg_val_loss,
         **params
     }
-    
+
     pred = np.array(predictions)
     true_vals = np.array(true_vals)
     pred_values = pred * (max_val - min_val) + min_val
     true_values = true_vals * (max_val - min_val) + min_val
-    
+
     trial_data.update({
         "trial_MAE": mean_absolute_error(true_values, pred_values),
         "trial_MSE": mean_squared_error(true_values, pred_values),
         "trial_RMSE": RMSE(true_values, pred_values),
         "trial_R2": r2_score(true_values, pred_values)
     })
-    
+
     # Plot and save validation results
     plt.figure(figsize=(10, 6))
     plt.plot(true_values, label="True Values", marker="o")
@@ -219,21 +239,23 @@ def objective(**params):
     plt.title(f"True vs Predicted (Validation Set)")
     plt.legend()
     plt.grid(True)
-    plt.savefig(rf"Y:\รันDeepในเครื่องอาจารย์บุ๊ค\CNN-LSTM\fig\trial_true_vs_pred_{len(pred_values)}.png")
+    plt.savefig(
+        rf"C:\Users\CO19\Downloads\รันDeepในเครื่องอาจารย์บุ๊ค\CNN-LSTM\fig\trial_true_vs_pred_{len(pred_values)}.png")
     plt.close()
-    
+
     # Save trial data
-    trial_filename = rf"Y:\รันDeepในเครื่องอาจารย์บุ๊ค\CNN-LSTM\result\trial_hyperparameters.csv"
+    trial_filename = rf"C:\Users\CO19\Downloads\รันDeepในเครื่องอาจารย์บุ๊ค\CNN-LSTM\result\trial_hyperparameters.csv"
     try:
         df_existing = pd.read_csv(trial_filename)
         df_new = pd.DataFrame([trial_data])
         df_combined = pd.concat([df_existing, df_new], ignore_index=True)
     except FileNotFoundError:
         df_combined = pd.DataFrame([trial_data])
-    
+
     df_combined.to_csv(trial_filename, index=False)
-    
+
     return avg_val_loss
+
 
 # Run Bayesian optimization
 result = gp_minimize(
@@ -256,7 +278,7 @@ best_seq_length = best_params['seq_length']
 (X_train, y_train, X_val, y_val, X_test, y_test), (min_val, max_val) = prepare_data(confirmed, best_seq_length)
 
 final_model = Model(
-    n_features=8,
+    n_features=7,
     cnn_hidden=best_params['cnn_hidden'],
     cnn_dropout=best_params['cnn_dropout'],
     lstm_hidden=best_params['lstm_hidden'],
@@ -279,7 +301,7 @@ for epoch in range(best_params['epochs']):
         loss = loss_fn(y_pred.squeeze(), y_train[idx])
         loss.backward()
         optimizer.step()
-    
+
     if (epoch + 1) % 100 == 0:
         print(f'Epoch [{epoch + 1}/{best_params["epochs"]}]')
 
@@ -357,11 +379,14 @@ optimization_results = pd.DataFrame({
     'Trial': range(len(result.func_vals)),
     'Loss': result.func_vals
 })
-optimization_results.to_csv(rf'Y:\รันDeepในเครื่องอาจารย์บุ๊ค\CNN-LSTM\results(CNN-LSTM)_optimization.csv', index=False)
+optimization_results.to_csv(
+    rf'C:\Users\CO19\Downloads\รันDeepในเครื่องอาจารย์บุ๊ค\CNN-LSTM\results(CNN-LSTM)_optimization.csv', index=False)
 
 # Save results to CSV
-results_df.to_csv(rf'Y:\รันDeepในเครื่องอาจารย์บุ๊ค\CNN-LSTM\results(CNN-LSTM)_predictions.csv', index=False)
-metrics_df.to_csv(rf'Y:\รันDeepในเครื่องอาจารย์บุ๊ค\CNN-LSTM\results(CNN-LSTM)_metrics.csv', index=False)
+results_df.to_csv(rf'C:\Users\CO19\Downloads\รันDeepในเครื่องอาจารย์บุ๊ค\CNN-LSTM\results(CNN-LSTM)_predictions.csv',
+                  index=False)
+metrics_df.to_csv(rf'C:\Users\CO19\Downloads\รันDeepในเครื่องอาจารย์บุ๊ค\CNN-LSTM\results(CNN-LSTM)_metrics.csv',
+                  index=False)
 
 # Plot final results
 plt.figure(figsize=(15, 6))
@@ -383,7 +408,7 @@ plt.ylabel('Value')
 plt.legend()
 plt.grid(True)
 plt.tight_layout()
-plt.savefig(rf'Y:\รันDeepในเครื่องอาจารย์บุ๊ค\CNN-LSTM\fig\final_predictions.png')
+plt.savefig(rf'C:\Users\CO19\Downloads\รันDeepในเครื่องอาจารย์บุ๊ค\CNN-LSTM\fig\final_predictions.png')
 plt.close()
 
 # Plot optimization progress
@@ -395,7 +420,7 @@ plt.ylabel('Objective value')
 plt.title('Bayesian Optimization Progress')
 plt.legend()
 plt.grid(True)
-plt.savefig(rf'Y:\รันDeepในเครื่องอาจารย์บุ๊ค\CNN-LSTM\fig\optimization_progress.png')
+plt.savefig(rf'C:\Users\CO19\Downloads\รันDeepในเครื่องอาจารย์บุ๊ค\CNN-LSTM\fig\optimization_progress.png')
 plt.close()
 
 # Save the best model
@@ -406,7 +431,7 @@ torch.save({
     'train_metrics': train_metrics,
     'test_metrics': test_metrics,
     'scaling_params': {'min_val': min_val, 'max_val': max_val}
-}, rf'Y:\รันDeepในเครื่องอาจารย์บุ๊ค\CNN-LSTM\best_model.pth')
+}, rf'C:\Users\CO19\Downloads\รันDeepในเครื่องอาจารย์บุ๊ค\CNN-LSTM\best_model.pth')
 
 print("\nResults, plots, and best model have been saved to the specified directories")
 
@@ -415,7 +440,8 @@ optimization_summary = pd.DataFrame({
     'Parameter': list(best_params.keys()),
     'Best Value': list(best_params.values())
 })
-optimization_summary.to_csv(rf'Y:\รันDeepในเครื่องอาจารย์บุ๊ค\CNN-LSTM\results(CNN-LSTM)_best_params.csv', index=False)
+optimization_summary.to_csv(
+    rf'C:\Users\CO19\Downloads\รันDeepในเครื่องอาจารย์บุ๊ค\CNN-LSTM\results(CNN-LSTM)_best_params.csv', index=False)
 
 print("\nOptimization summary:")
 print(optimization_summary)
