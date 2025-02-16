@@ -37,20 +37,23 @@ torch.manual_seed(RANDOM_SEED)
 data_path = rf'Y:\รันDeepในเครื่องอาจารย์บุ๊ค\partition_combined_data_upsampled_pm_3H_spline_1degreeM.csv'
 confirmed = pd.read_csv(data_path)
 confirmed = confirmed[['TP', 'WS', 'AP', 'HM', 'WD', 'PCPT', 'PM2.5', 'Season']].values.astype('float32')
-print(f'Original Size: \n{confirmed}\n')
-confirmed = confirmed[:int(len(confirmed) * 0.1)]
-print(f'Reduced Size: \n{confirmed}\n')
+# print(f'Original Size: \n{confirmed}\n')
+# confirmed = confirmed[:int(len(confirmed) * 0.1)]
+# print(f'Reduced Size: \n{confirmed}\n')
 
 # ฟังก์ชันสร้าง sequence ที่รองรับ sequence length ที่แตกต่างกัน
-def create_sequences(data, seq_length):
+def create_sequences(X, y, seq_length):
     xs, ys = [], []
-    for i in range(len(data) - seq_length):
-        xs.append(data[i:(i + seq_length)])
-        ys.append(data[i + seq_length, 0])
+    for i in range(len(X) - seq_length):
+        xs.append(X[i:(i + seq_length)])
+        ys.append(y[i + seq_length])
+        # print(f'\nxs: {xs}\n ys: {ys}')
     return np.array(xs), np.array(ys)
 
-def prepare_data(data, seq_length, train_size=0.7, val_size=0.15):
-    X, y = create_sequences(data, seq_length)
+def prepare_data(confirmed, seq_length, train_size=0.7, val_size=0.15):
+    X, y = confirmed[['TP', 'WS', 'AP', 'HM', 'WD', 'PCPT', 'Season']].values.astype('float32') , confirmed['PM2.5'].values.astype('float32')
+    X, y = create_sequences(X, y, seq_length)
+
     
     # แบ่งข้อมูล
     train_idx = int(len(X) * train_size)
