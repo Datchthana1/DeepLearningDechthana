@@ -6,30 +6,16 @@ import matplotlib.pyplot as plt
 from pylab import rcParams
 from pandas.plotting import register_matplotlib_converters
 from torch import nn, optim
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, root_mean_squared_error
 from skopt import BayesSearchCV
 from skopt.space import Real, Integer
 from skopt.utils import use_named_args
 from skopt import gp_minimize
+from torch.utils.data import DataLoader, TensorDataset
 
 # Device setup
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
-
-# Metric functions
-def MAE(true, pred):
-    return np.mean(np.abs(true - pred))
-
-def MSE(true, pred):
-    return np.mean((true - pred) ** 2)
-
-def RMSE(true, pred):
-    return np.sqrt(MSE(true, pred))
-
-def R2(true, pred):
-    ss_res = np.sum((true - pred) ** 2)
-    ss_tot = np.sum((true - np.mean(true)) ** 2)
-    return 1 - ss_res / ss_tot
 
 # Plotting setup
 sns.set(style='whitegrid', palette='muted', font_scale=1.2)
@@ -40,13 +26,14 @@ np.random.seed(RANDOM_SEED)
 torch.manual_seed(RANDOM_SEED)
 
 # Data loading
-data_path = r'D:\OneFile\WorkOnly\AllCode\Python\DeepLearning\partition_combined_data_upsampled_pm_3H_spline_1degreeM.csv'
+data_path = rf'D:\OneFile\WorkOnly\AllCode\Python\DeepLearning\partition_combined_data_upsampled_pm_3H_spline_1degreeM.csv'
 confirmed = pd.read_csv(data_path)
-confirmed = confirmed[['TP', 'WS', 'AP', 'HM', 'WD', 'PCPT', 'PM2.5', 'Season']][:2500]
+confirmed['PM2.5N'] = confirmed['PM2.5'].shift(-1)
+confirmed = confirmed[['TP', 'WS', 'AP', 'HM', 'WD', 'PCPT', 'PM2.5', 'Season', 'PM2.5N']].dropna()
 print(f'Original Size: \n{confirmed}\n')
 print(f'Dataframe: {confirmed}')
 
-# Sequence creation functions
+# Modified sequence creation functions to support batching
 def create_sequences(X, y, seq_length):
     xs, ys = [], []
     for i in range(len(X) - seq_length):
@@ -55,8 +42,8 @@ def create_sequences(X, y, seq_length):
     return np.array(xs), np.array(ys)
 
 def prepare_data(confirmed, seq_length, train_size=0.7, val_size=0.15):
-    X = confirmed[['TP', 'WS', 'AP', 'HM', 'WD', 'PCPT', 'Season']].values.astype('float32')
-    y = confirmed['PM2.5'].values.astype('float32')
+    X = confirmed[['TP', 'WS', 'AP', 'HM', 'WD', 'PCPT', 'Season', 'PM2.5']].values.astype('float32')
+    y = confirmed['PM2.5N'].values.astype('float32')
     X, y = create_sequences(X, y, seq_length)
 
     train_idx = int(len(X) * train_size)
@@ -66,7 +53,6 @@ def prepare_data(confirmed, seq_length, train_size=0.7, val_size=0.15):
     X_val, y_val = X[train_idx:val_idx], y[train_idx:val_idx]
     X_test, y_test = X[val_idx:], y[val_idx:]
 
-    # ใช้ค่าสเกลจากตัวแปรแรกใน sequence (TP)
     min_val = X_train[:, :, 0].min()
     max_val = X_train[:, :, 0].max()
 
@@ -80,25 +66,29 @@ def prepare_data(confirmed, seq_length, train_size=0.7, val_size=0.15):
     X_test = MinMaxScale(X_test, min_val, max_val)
     y_test = MinMaxScale(y_test, min_val, max_val)
 
-    X_train = torch.from_numpy(X_train).float().to(device)
-    y_train = torch.from_numpy(y_train).float().to(device)
-    X_val = torch.from_numpy(X_val).float().to(device)
-    y_val = torch.from_numpy(y_val).float().to(device)
-    X_test = torch.from_numpy(X_test).float().to(device)
-    y_test = torch.from_numpy(y_test).float().to(device)
+    # Convert to PyTorch tensors
+    X_train = torch.from_numpy(X_train).float()
+    y_train = torch.from_numpy(y_train).float()
+    X_val = torch.from_numpy(X_val).float()
+    y_val = torch.from_numpy(y_val).float()
+    X_test = torch.from_numpy(X_test).float()
+    y_test = torch.from_numpy(y_test).float()
 
-    return (X_train, y_train, X_val, y_val, X_test, y_test), (min_val, max_val)
+    # Create DataLoader objects
+    train_dataset = TensorDataset(X_train, y_train)
+    val_dataset = TensorDataset(X_val, y_val)
+    test_dataset = TensorDataset(X_test, y_test)
 
-# --- Modified Model ---
+    return (train_dataset, val_dataset, test_dataset), (min_val, max_val)
+
 class Model(nn.Module):
     def __init__(self, n_features, cnn_layers, cnn_hidden, cnn_dropout,
                  lstm_hidden, lstm_layers, lstm_dropout, seq_len):
         super(Model, self).__init__()
         self.seq_len = seq_len
-        fixed_kernel = 2  # kernel size ที่ใช้ใน CNN
+        fixed_kernel = 2
 
         layers = []
-        # สร้าง CNN ตามจำนวนชั้น (cnn_layers)
         for i in range(cnn_layers):
             in_channels = n_features if i == 0 else cnn_hidden
             layers.append(nn.Conv1d(in_channels, cnn_hidden, kernel_size=fixed_kernel, stride=1, padding=1))
@@ -108,43 +98,47 @@ class Model(nn.Module):
         layers.append(nn.Dropout(cnn_dropout))
         self.cnn = nn.Sequential(*layers)
 
-        # LSTM ใช้ขนาด input เท่ากับ cnn_hidden
         self.lstm = nn.LSTM(input_size=cnn_hidden, hidden_size=lstm_hidden,
-                            num_layers=lstm_layers,
-                            dropout=lstm_dropout if lstm_layers > 1 else 0.0,
-                            batch_first=True)
+                           num_layers=lstm_layers,
+                           dropout=lstm_dropout if lstm_layers > 1 else 0.0,
+                           batch_first=True)
         self.linear = nn.Linear(lstm_hidden, 1)
 
     def forward(self, sequences):
-        # เปลี่ยน shape สำหรับ CNN: (batch, features, seq_len)
         x = sequences.transpose(1, 2)
         x = self.cnn(x)
-        # เปลี่ยนกลับเป็น (batch, seq_len, features) สำหรับ LSTM
         x = x.transpose(1, 2)
         lstm_out, _ = self.lstm(x)
-        # ใช้ time step สุดท้ายในการทำนาย
         last_time_step = lstm_out[:, -1, :]
         y_pred = self.linear(last_time_step)
         return y_pred
 
-# --- Define the optimization space ---
+# Modified optimization space to include batch_size
 space = [
     Integer(3, 20, name='seq_length'),
-    Integer(1, 3, name='cnn_layers'),         # จำนวนชั้นของ CNN
-    Integer(16, 512, name='cnn_hidden'),        # ขนาด hidden ของ CNN (ใช้กับทุกชั้น)
+    Integer(1, 5, name='cnn_layers'),
+    Integer(16, 512, name='cnn_hidden'),
     Real(0.0, 0.5, name='cnn_dropout'),
-    Integer(16, 512, name='lstm_hidden'),         # ขนาด hidden ของ LSTM
-    Integer(1, 5, name='lstm_layers'),           # จำนวนชั้นของ LSTM
+    Integer(16, 512, name='lstm_hidden'),
+    Integer(1, 5, name='lstm_layers'),
     Real(0.0, 0.5, name='lstm_dropout'),
     Real(1e-5, 1e-2, prior='log-uniform', name='lr'),
-    Integer(300, 1500, name='epochs')
+    Integer(300, 1000, name='epochs'),
+    Integer(16, 256, name='batch_size')  # Added batch_size parameter
 ]
 
-# --- Objective function for Bayesian optimization ---
+
+
 @use_named_args(space)
 def objective(**params):
-    seq_length = params['seq_length']
-    (X_train, y_train, X_val, y_val, _, _), (min_val, max_val) = prepare_data(confirmed, seq_length)
+    objective.trial_counter += 1
+    seq_length = int(params['seq_length'])
+    batch_size = int(params['batch_size'])
+    (train_dataset, val_dataset, _), (min_val, max_val) = prepare_data(confirmed, seq_length)
+    
+    # Create DataLoaders with the current batch_size
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
     print(f'''
           seq_length : {seq_length},
@@ -154,14 +148,15 @@ def objective(**params):
           lstm_hidden : {params['lstm_hidden']},
           lstm_layers : {params['lstm_layers']},
           lstm_dropout : {params['lstm_dropout']},
+          weight_decay: 0.00001,
           lr : {params['lr']},
-          epochs : {params['epochs']}
+          epochs : {params['epochs']},
+          batch_size : {batch_size}
           ''')
     print('---' * 10 + ' Start Model ' + '---' * 10)
 
-    # สร้างโมเดลโดยใช้ hyperparameter ที่ระบุ
     model = Model(
-        n_features=7,
+        n_features=8,
         cnn_layers=int(params['cnn_layers']),
         cnn_hidden=int(params['cnn_hidden']),
         cnn_dropout=float(params['cnn_dropout']),
@@ -171,17 +166,17 @@ def objective(**params):
         seq_len=int(seq_length)
     ).to(device)
 
-    optimizer = optim.Adam(model.parameters(), lr=params['lr'], weight_decay=(params['lr'] * params['lr']))
+    optimizer = optim.Adam(model.parameters(), lr=params['lr'], weight_decay=0.00001)
     loss_fn = nn.MSELoss()
 
-    # Training loop
+    # Modified training loop for batch processing
     model.train()
     for epoch in range(params['epochs']):
-        for idx, seq in enumerate(X_train):
+        for batch_X, batch_y in train_loader:
+            batch_X, batch_y = batch_X.to(device), batch_y.to(device)
             optimizer.zero_grad()
-            seq = torch.unsqueeze(seq, 0)
-            y_pred = model(seq)
-            loss = loss_fn(y_pred.squeeze(), y_train[idx])
+            y_pred = model(batch_X)
+            loss = loss_fn(y_pred.squeeze(), batch_y)
             loss.backward()
             optimizer.step()
 
@@ -190,24 +185,26 @@ def objective(**params):
 
     print('---' * 10 + ' Start Model Evaluate ' + '---' * 10)
 
-    # Validation evaluation
     model.eval()
     val_loss = 0
     predictions = []
     true_vals = []
+    
     with torch.no_grad():
-        for idx, seq in enumerate(X_val):
-            seq = torch.unsqueeze(seq, 0)
-            y_val_pred = model(seq)
-            loss = loss_fn(y_val_pred.squeeze(), y_val[idx])
-            val_loss += loss.item()
-            predictions.append(y_val_pred.squeeze().cpu().numpy())
-            true_vals.append(y_val[idx].cpu().numpy())
+        for batch_X, batch_y in val_loader:
+            batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+            y_val_pred = model(batch_X)
+            loss = loss_fn(y_val_pred.squeeze(), batch_y)
+            val_loss += loss.item() * batch_X.size(0)
+            preds = y_val_pred.squeeze()
+            if preds.ndim == 0:
+                preds = preds.unsqueeze(0)
+            predictions.extend(preds.cpu().numpy())
+            true_vals.extend(batch_y.cpu().numpy())
 
-    avg_val_loss = val_loss / len(X_val)
+    avg_val_loss = val_loss / len(val_dataset)
     print(f'Average validation loss: {avg_val_loss}')
 
-    # คำนวณ metric ต่าง ๆ หลัง rescaling
     pred = np.array(predictions)
     true_vals = np.array(true_vals)
     pred_values = pred * (max_val - min_val) + min_val
@@ -218,7 +215,7 @@ def objective(**params):
         **params,
         "trial_MAE": mean_absolute_error(true_values, pred_values),
         "trial_MSE": mean_squared_error(true_values, pred_values),
-        "trial_RMSE": RMSE(true_values, pred_values),
+        "trial_RMSE": root_mean_squared_error(true_values, pred_values),
         "trial_R2": r2_score(true_values, pred_values)
     }
 
@@ -231,11 +228,11 @@ def objective(**params):
     plt.title("True vs Predicted (Validation Set)")
     plt.legend()
     plt.grid(True)
-    plt.savefig(rf"C:\Users\CO19\Downloads\CNN-LSTM\fig\trial_true_vs_pred_{len(pred_values)}.png")
+    plt.savefig(rf"D:\OneFile\WorkOnly\AllCode\Python\DeepLearning\CNN-LSTM-PM2.5\fig\trial_true_vs_pred_{objective.trial_counter}.png")
     plt.close()
 
     # Save trial results
-    trial_filename = r"C:\Users\CO19\Downloads\CNN-LSTM\result\trial_hyperparameters.csv"
+    trial_filename = r"D:\OneFile\WorkOnly\AllCode\Python\DeepLearning\CNN-LSTM-PM2.5\result\trial_hyperparameters.csv"
     try:
         df_existing = pd.read_csv(trial_filename)
         df_new = pd.DataFrame([trial_data])
@@ -246,11 +243,13 @@ def objective(**params):
 
     return avg_val_loss
 
-# --- Run Bayesian optimization ---
+objective.trial_counter = 0
+
+# Run Bayesian optimization
 result = gp_minimize(
     func=objective,
     dimensions=space,
-    n_calls=50,
+    n_calls=100,
     n_random_starts=10,
     noise=0.1,
     random_state=RANDOM_SEED
@@ -262,12 +261,16 @@ print("\nBest parameters found:")
 for param, value in best_params.items():
     print(f"{param}: {value}")
 
-# --- Train final model with best parameters ---
+# Train final model with best parameters
 best_seq_length = best_params['seq_length']
-(X_train, y_train, X_val, y_val, X_test, y_test), (min_val, max_val) = prepare_data(confirmed, best_seq_length)
+(train_dataset, val_dataset, test_dataset), (min_val, max_val) = prepare_data(confirmed, best_seq_length)
+
+# Create DataLoaders with best batch size
+train_loader = DataLoader(train_dataset, batch_size=best_params['batch_size'], shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=best_params['batch_size'], shuffle=False)
 
 final_model = Model(
-    n_features=7,
+    n_features=8,
     cnn_layers=best_params['cnn_layers'],
     cnn_hidden=best_params['cnn_hidden'],
     cnn_dropout=best_params['cnn_dropout'],
@@ -277,46 +280,50 @@ final_model = Model(
     seq_len=best_seq_length
 ).to(device)
 
-optimizer = optim.Adam(final_model.parameters(), lr=best_params['lr'])
+optimizer = optim.Adam(final_model.parameters(), lr=best_params['lr'], weight_decay=0.00001)
 loss_fn = nn.MSELoss()
 
 print("\nTraining final model with best parameters...")
 final_model.train()
 for epoch in range(best_params['epochs']):
-    for idx, seq in enumerate(X_train):
+    for batch_X, batch_y in train_loader:
+        batch_X, batch_y = batch_X.to(device), batch_y.to(device)
         optimizer.zero_grad()
-        seq = torch.unsqueeze(seq, 0)
-        y_pred = final_model(seq)
-        loss = loss_fn(y_pred.squeeze(), y_train[idx])
+        y_pred = final_model(batch_X)
+        loss = loss_fn(y_pred.squeeze(), batch_y)
         loss.backward()
         optimizer.step()
 
     if (epoch + 1) % 100 == 0:
         print(f'Epoch [{epoch + 1}/{best_params["epochs"]}]')
 
-# --- Evaluation on Training and Test sets ---
+# Evaluation
 final_model.eval()
 train_preds = []
+train_true = []
 with torch.no_grad():
-    for seq in X_train:
-        seq = torch.unsqueeze(seq, 0)
-        pred = final_model(seq)
-        train_preds.append(pred.squeeze().cpu().item())
+    for batch_X, batch_y in train_loader:
+        batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+        pred = final_model(batch_X)
+        train_preds.extend(pred.squeeze().cpu().numpy())
+        train_true.extend(batch_y.cpu().numpy())
 
-train_true = y_train.cpu().numpy()
 train_preds = np.array(train_preds)
+train_true = np.array(train_true)
 train_preds_inv = train_preds * (max_val - min_val) + min_val
 train_true_inv = train_true * (max_val - min_val) + min_val
 
 test_preds = []
+test_true = []
 with torch.no_grad():
-    for seq in X_test:
-        seq = torch.unsqueeze(seq, 0)
-        pred = final_model(seq)
-        test_preds.append(pred.squeeze().cpu().item())
+    for batch_X, batch_y in test_loader:
+        batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+        pred = final_model(batch_X)
+        test_preds.extend(pred.squeeze().cpu().numpy())
+        test_true.extend(batch_y.cpu().numpy())
 
-test_true = y_test.cpu().numpy()
 test_preds = np.array(test_preds)
+test_true = np.array(test_true)
 test_preds_inv = test_preds * (max_val - min_val) + min_val
 test_true_inv = test_true * (max_val - min_val) + min_val
 
@@ -342,13 +349,14 @@ print("\nTest Metrics:")
 for metric, value in test_metrics.items():
     print(f"{metric}: {value:.4f}")
 
-# Save and plot results (paths และการ plot ยังคงเหมือนเดิม)
+# Save results and create plots
 results_df = pd.DataFrame({
     'True Values': test_true_inv,
     'Predicted Values': test_preds_inv
 })
 
 metrics_df = pd.DataFrame({
+    'weigh_decay': 0.00001,
     'Train_MAE': [train_metrics['MAE']],
     'Train_MSE': [train_metrics['MSE']],
     'Train_RMSE': [train_metrics['RMSE']],
@@ -357,18 +365,21 @@ metrics_df = pd.DataFrame({
     'Test_MSE': [test_metrics['MSE']],
     'Test_RMSE': [test_metrics['RMSE']],
     'Test_R2': [test_metrics['R2']],
-    'Best_Sequence_Length': [best_seq_length]
+    'Best_Sequence_Length': [best_seq_length],
+    'Best_Batch_Size': [best_params['batch_size']]  # Added batch size to metrics
 })
 
 optimization_results = pd.DataFrame({
     'Trial': range(len(result.func_vals)),
     'Loss': result.func_vals
 })
-optimization_results.to_csv(rf'C:\Users\CO19\Downloads\CNN-LSTM\results(CNN-LSTM)_optimization.csv', index=False)
 
-results_df.to_csv(rf'C:\Users\CO19\Downloads\CNN-LSTM\results(CNN-LSTM)_predictions.csv', index=False)
-metrics_df.to_csv(rf'C:\Users\CO19\Downloads\CNN-LSTM\results(CNN-LSTM)_metrics.csv', index=False)
+# Save results to CSV files
+optimization_results.to_csv(rf'D:\OneFile\WorkOnly\AllCode\Python\DeepLearning\CNN-LSTM-PM2.5\results(CNN-LSTM)_optimization.csv', index=False)
+results_df.to_csv(rf'D:\OneFile\WorkOnly\AllCode\Python\DeepLearning\CNN-LSTM-PM2.5\results(CNN-LSTM)_predictions.csv', index=False)
+metrics_df.to_csv(rf'D:\OneFile\WorkOnly\AllCode\Python\DeepLearning\CNN-LSTM-PM2.5\results(CNN-LSTM)_metrics.csv', index=False)
 
+# Create and save plots
 plt.figure(figsize=(15, 6))
 plt.subplot(1, 2, 1)
 plt.plot(train_true_inv[:100], label='True Values', color='blue')
@@ -388,9 +399,10 @@ plt.ylabel('Value')
 plt.legend()
 plt.grid(True)
 plt.tight_layout()
-plt.savefig(rf'C:\Users\CO19\Downloads\CNN-LSTM\fig\final_predictions.png')
+plt.savefig(rf'D:\OneFile\WorkOnly\AllCode\Python\DeepLearning\CNN-LSTM-PM2.5\fig\final_predictions.png')
 plt.close()
 
+# Plot optimization progress
 plt.figure(figsize=(10, 6))
 plt.plot(result.func_vals, 'b-', label='Objective value')
 plt.plot(np.minimum.accumulate(result.func_vals), 'r-', label='Best value')
@@ -399,9 +411,10 @@ plt.ylabel('Objective value')
 plt.title('Bayesian Optimization Progress')
 plt.legend()
 plt.grid(True)
-plt.savefig(rf'C:\Users\CO19\Downloads\CNN-LSTM\fig\optimization_progress.png')
+plt.savefig(rf'D:\OneFile\WorkOnly\AllCode\Python\DeepLearning\CNN-LSTM-PM2.5\fig\optimization_progress.png')
 plt.close()
 
+# Save model and parameters
 torch.save({
     'model_state_dict': final_model.state_dict(),
     'optimizer_state_dict': optimizer.state_dict(),
@@ -409,15 +422,14 @@ torch.save({
     'train_metrics': train_metrics,
     'test_metrics': test_metrics,
     'scaling_params': {'min_val': min_val, 'max_val': max_val}
-}, r'C:\Users\CO19\Downloads\CNN-LSTM\best_model.pth')
+}, r'D:\OneFile\WorkOnly\AllCode\Python\DeepLearning\CNN-LSTM-PM2.5\best_model.pth')
 
-print("\nResults, plots, and best model have been saved to the specified directories")
-
+# Create and save optimization summary
 optimization_summary = pd.DataFrame({
     'Parameter': list(best_params.keys()),
     'Best Value': list(best_params.values())
 })
-optimization_summary.to_csv(rf'C:\Users\CO19\Downloads\CNN-LSTM\results(CNN-LSTM)_best_params.csv', index=False)
+optimization_summary.to_csv(rf'D:\OneFile\WorkOnly\AllCode\Python\DeepLearning\CNN-LSTM-PM2.5\results(CNN-LSTM)_best_params.csv', index=False)
 
 print("\nOptimization summary:")
 print(optimization_summary)
